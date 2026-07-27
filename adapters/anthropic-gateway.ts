@@ -4,6 +4,7 @@ import { pathToFileURL } from "url";
 import { codexDefaults, parseProviderModel } from "./map.js";
 import type { AnthropicRequest } from "./types.js";
 import { chatCodexOAuth } from "./providers/codex-oauth.js";
+import { withAggregatedReply } from "./sse-aggregator.js";
 import { getCodexAccessToken, getCodexLoginStatus, CodexNativeAuthError } from "./openai-auth.js";
 
 // Importing this module never starts a listener or reads credentials.
@@ -35,7 +36,7 @@ export function createGateway() {
       res.raw.flushHeaders?.();
       return chatCodexOAuth(res, body, route.model, route.reasoning);
     }
-    return res.code(400).send({ error: "Only stream: true is supported" });
+    return withAggregatedReply(res, buffered => chatCodexOAuth(buffered as typeof res, body, route.model, route.reasoning));
   });
   return fastify;
 }
