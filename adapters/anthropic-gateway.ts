@@ -24,11 +24,21 @@ export function createGateway() {
     } catch {
       return res.code(400).send({ error: "Invalid model, @effort or messages" });
     }
+    const choice = body.tool_choice;
+    if (choice?.type === "tool" && choice.name !== "WebSearch" && choice.name !== "WebFetch"
+      && !body.tools?.some(tool => tool.name === choice.name)) {
+      return res.code(400).send({ error: "Forced tool is unavailable" });
+    }
     try { await getCodexAccessToken(); }
     catch (error) {
       return res.code(401).send({ error: error instanceof CodexNativeAuthError ? error.message : "Native Codex credentials unavailable" });
     }
     active = route;
+    // Claude's local search tools are replaced by Codex server-side web search.
+    body.tools = body.tools?.filter(t => t.name !== "WebSearch" && t.name !== "WebFetch");
+    const searchNote = "Use native server-side web search when needed.";
+    body.system = Array.isArray(body.system) ? [...body.system, { type: "text", text: searchNote }]
+      : [body.system, searchNote].filter(Boolean).join("\n\n");
     if (body.stream === true) {
       res.raw.setHeader("Content-Type", "text/event-stream");
       res.raw.setHeader("Cache-Control", "no-cache, no-transform");
