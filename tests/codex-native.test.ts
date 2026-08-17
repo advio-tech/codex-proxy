@@ -188,3 +188,91 @@ describe("native Codex credentials", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+describe("Native-only routing and Messages/SSE", () => {
+  it.each(["opus", "sonnet", "haiku", "claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5", "claude-internal-model", "opus[1m]", "sonnet[1m]"])("%s → configured gpt-6.1-sol@medium", (model) => {
+    expect(parseProviderModel(model, { provider: "codex-oauth", model: "codex-another", reasoning: "high" }))
+      .toEqual({ provider: "codex-oauth", model: "gpt-6.1-sol", reasoning: "medium" });
+  });
+
+  it("accepts Codex model families, effort and configured defaults", () => {
+    expect(parseProviderModel("codex-future-model", { provider: "codex-oauth", model: "codex-previous", reasoning: "high" }).reasoning).toBe("medium");
+    expect(() => parseProviderModel("gpt-6.1-sol@")).toThrow("@effort");
+    expect(() => parseProviderModel("gpt-6.1-sol@unsupported")).toThrow("@effort");
+    for (const model of ["gpt-6.1-sol", "codex-future-model", "codex-oauth:codex-future-model", "codex-oauth/codex-future-model"]) {
+      expect(parseProviderModel(`${model}@xhigh`)).toEqual({ provider: "codex-oauth", model: model.replace(/^codex-oauth[:/]/, ""), reasoning: "xhigh" });
+    }
+    vi.stubEnv("CCX_DEFAULT_MODEL", "codex-future-model@low");
+    expect(parseProviderModel("haiku")).toEqual({ provider: "codex-oauth", model: "codex-future-model", reasoning: "low" });
+    expect(parseProviderModel("sonnet@max").reasoning).toBe("max");
+  });
+
+  it.each(["anthropic:claude-opus-4-8", "openrouter:anything", "openai:gpt-6.1-sol", "gemini:some-model",
+    "gemini-oauth:anything", "glm:anything", "cline-pass:anything", "unknown:model", "unknown/model", "claude-unknown:external", "gemini", "glm-5.2", "anthropic", "openai", "openrouter"])("%s is rejected before fetch", async (model) => {
+    expect((await request(model)).statusCode).toBe(400);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("health and status reflect model and effort; legacy provider env is ignored", async () => {
+    app = createGateway();
+    const expected = { provider: "codex-oauth", model: "gpt-6.1-sol", reasoning: "medium" };
+    expect((await app.inject({ url: "/_status" })).json()).toEqual(expected);
+    expect((await app.inject({ url: "/healthz" })).json().active).toEqual(expected);
+    await credentials();
+    fakeBackend();
+    await request("codex-oauth:codex-future-model@xhigh");
+    expect((await app.inject({ url: "/_status" })).json()).toEqual({ ...expected, model: "codex-future-model", reasoning: "xhigh" });
+    expect((await app.inject({ url: "/unknown-provider/route" })).statusCode).toBe(404);
+    vi.stubEnv("CCX_DEFAULT_PROVIDER", "anthropic");
+    expect((await request("sonnet")).statusCode).toBe(200);
+  });
+
+  it("legacy provider, auth and API key environment cannot activate another backend", async () => {
+    for (const [name, value] of Object.entries({
+      CODEX_ONLY: "0", CODEX_AUTH_SOURCE: "proxy", CCX_DEFAULT_PROVIDER: "external",
+      OPENAI_API_KEY: "synthetic-key", OPENROUTER_API_KEY: "synthetic-key",
+      GEMINI_API_KEY: "synthetic-key", ANTHROPIC_API_KEY: "synthetic-key",
+      ANTHROPIC_UPSTREAM_URL: "https://synthetic.invalid", GLM_UPSTREAM_URL: "https://synthetic.invalid",
+      ZAI_API_KEY: "synthetic-key", GLM_API_KEY: "synthetic-key",
+    })) vi.stubEnv(name, value);
+    await credentials();
+    fakeBackend();
+    expect((await request("sonnet")).statusCode).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("https://chatgpt.com/backend-api/codex/responses");
+    expect((await request("unknown-model")).statusCode).toBe(400);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves stream tool calls and nonstream aggregation without request logs", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await credentials();
+    fakeBackend();
+    const streamed = await request("claude-internal-model", true);
+    expect(streamed.headers["content-type"]).toContain("text/event-stream");
+    const events = streamed.body.split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)));
+    expect(events.find((e) => e.type === "content_block_start").content_block).toEqual({ type: "tool_use", id: "call_1", name: "Bash", input: {} });
+    expect(events.filter((e) => e.delta?.type === "input_json_delta").map((e) => e.delta.partial_json).join(""))
+      .toBe('{"command":"echo synthetic"}');
+    expect(events.find((e) => e.type === "message_delta").delta.stop_reason).toBe("tool_use");
+    const aggregated = (await request("sonnet")).json();
+    expect(aggregated.content).toEqual([{ type: "tool_use", id: "call_1", name: "Bash", input: { command: "echo synthetic" } }]);
+    expect(aggregated.stop_reason).toBe("tool_use");
+    const sent = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(sent.model).toBe("gpt-6.1-sol");
+    expect(sent.reasoning.effort).toBe("medium");
+    expect(log).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+    await expect(access(join(root, "requests.log"))).rejects.toThrow();
+  });
+
+  it("hides backend errors and never exposes backend text", async () => {
+    await credentials();
+    fetchMock.mockResolvedValue(new Response("synthetic-backend-secret", { status: 401 }));
+    const response = await request("codex", true);
+    expect(response.body).toContain("Codex backend HTTP 401");
+    expect(response.body.includes("synthetic-backend-secret")).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
