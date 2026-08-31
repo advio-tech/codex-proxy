@@ -276,3 +276,66 @@ describe("Native-only routing and Messages/SSE", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("safe Codex failure diagnostics", () => {
+  it("records HTTP status and known error code without credentials or backend text", async () => {
+    const auth = await credentials();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ error: {
+      code: "rate_limit_exceeded", message: "synthetic-private-prompt synthetic-refresh",
+    } }), { status: 429, headers: { "x-request-id": "req_synthetic" } }));
+    await request("gpt-6.1-sol");
+    const log = error.mock.calls.map(c => c.join(" ")).join("\n");
+    expect(log).toContain('"status":429');
+    expect(log).toContain('"code":"rate_limit_exceeded"');
+    expect(log).toContain('"upstreamRequestId":"req_synthetic"');
+    expect(log).not.toContain(auth.token);
+    expect(log).not.toContain("synthetic-private-prompt");
+    expect(log).not.toContain("synthetic-refresh");
+    expect(log).not.toContain("synthetic-account");
+  });
+
+  it("records network cause and retries, without printing Error.message", async () => {
+    await credentials();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockRejectedValue(new TypeError("synthetic-private-prompt", {
+      cause: Object.assign(new Error("synthetic-refresh"), { code: "ECONNRESET" }),
+    }));
+    await request("gpt-6.1-sol");
+    const logs = error.mock.calls.map(c => JSON.parse(String(c[0]).replace("[codex-diagnostic] ", "")));
+    expect(logs.map(l => l.outcome)).toEqual(["retry", "retry", "failed"]);
+    expect(new Set(logs.map(l => l.requestId)).size).toBe(1);
+    expect(logs[2]).toMatchObject({ phase: "connect", code: "ECONNRESET", category: "network" });
+    expect(JSON.stringify(logs)).not.toContain("synthetic-private-prompt");
+    expect(JSON.stringify(logs)).not.toContain("synthetic-refresh");
+  });
+
+  it("records response.failed after streaming begins, even if tools are in progress", async () => {
+    await credentials();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockResolvedValue(sse([
+      { type: "response.output_item.added", item: { type: "function_call", id: "fc1", call_id: "c1", name: "Bash" } },
+      { type: "response.failed", response: { error: { code: "server_error", message: "synthetic-private-prompt" } } },
+    ]));
+    await request("gpt-6.1-sol", true);
+    expect(error).toHaveBeenCalledTimes(1);
+    const log = String(error.mock.calls[0][0]);
+    expect(log).toContain('"phase":"stream"');
+    expect(log).toContain('"event":"response.failed"');
+    expect(log).toContain('"code":"server_error"');
+    expect(log).not.toContain("synthetic-private-prompt");
+  });
+
+  it("does not log unknown backend error identifiers", async () => {
+    await credentials();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ error: {
+      code: "synthetic-refresh", type: "synthetic-private-prompt",
+    } }), { status: 400 }));
+    await request("gpt-6.1-sol");
+    const log = String(error.mock.calls[0][0]);
+    expect(log).toContain('"code":"unrecognized"');
+    expect(log).not.toContain("synthetic-refresh");
+    expect(log).not.toContain("synthetic-private-prompt");
+  });
+});
