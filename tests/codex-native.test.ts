@@ -339,3 +339,89 @@ describe("safe Codex failure diagnostics", () => {
     expect(log).not.toContain("synthetic-private-prompt");
   });
 });
+
+
+describe("VPN recovery", () => {
+  beforeEach(() => {
+    vi.stubEnv("CCX_NETWORK_RETRIES", "2");
+    vi.stubEnv("CCX_NETWORK_RETRY_DELAY_MS", "1");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  it("continues retrying after connection attempts fail and resumes on recovery", async () => {
+    await credentials();
+    fakeBackend();
+    const error = new TypeError("network down", { cause: Object.assign(new Error("timeout"), { code: "UND_ERR_CONNECT_TIMEOUT" }) });
+    fetchMock.mockRejectedValueOnce(error).mockRejectedValueOnce(error).mockRejectedValueOnce(error);
+    const response = await request("gpt-6.1-sol", true);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(response.body).toContain('"stop_reason":"tool_use"');
+    expect(response.body).not.toContain('event: error');
+    expect(response.body).not.toContain('codex proxy error');
+  });
+
+  it("discards interrupted partial output and tools before replaying the request", async () => {
+    await credentials();
+    fakeBackend();
+    let reads = 0;
+    const chunk = new TextEncoder().encode([
+      { type: "response.output_text.delta", delta: "discarded partial text" },
+      { type: "response.output_item.added", item: { type: "function_call", id: "aborted-tool", call_id: "old-call", name: "Bash" } },
+      { type: "response.function_call_arguments.delta", item_id: "aborted-tool", delta: '{"command":"discarded command"}' },
+    ].map(e => `data: ${JSON.stringify(e)}\n\n`).join(""));
+    fetchMock.mockResolvedValueOnce(new Response(new ReadableStream({ pull(controller) {
+      if (reads++ === 0) controller.enqueue(chunk);
+      else controller.error(new TypeError("terminated", { cause: Object.assign(new Error("read timeout"), { code: "ETIMEDOUT" }) }));
+    } })));
+    const response = await request("gpt-6.1-sol", true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(response.body).not.toContain("discarded partial text");
+    expect(response.body).not.toContain("discarded command");
+    expect(response.body).not.toContain("old-call");
+    expect(response.body.match(/event: message_start\n/g)).toHaveLength(1);
+    expect(response.body.match(/event: message_stop\n/g)).toHaveLength(1);
+    expect(response.body).toContain('"stop_reason":"tool_use"');
+  });
+
+  it("retries a clean EOF without response.completed", async () => {
+    await credentials();
+    fakeBackend();
+    fetchMock.mockResolvedValueOnce(sse([{ type: "response.output_text.delta", delta: "truncated" }]));
+    const response = await request("gpt-6.1-sol");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(response.body).not.toContain("truncated");
+    expect(response.json().stop_reason).toBe("tool_use");
+  });
+
+  it("returns a genuine API error rather than a successful end_turn on failure", async () => {
+    await credentials();
+    vi.stubEnv("CCX_NETWORK_RETRIES", "0");
+    fetchMock.mockResolvedValue(new Response("unavailable", { status: 503 }));
+    const response = await request("gpt-6.1-sol");
+    expect(response.statusCode).toBe(503);
+    expect(response.json().type).toBe("error");
+    expect(response.json().error.type).toBe("api_error");
+    expect(response.body).not.toContain("end_turn");
+  });
+
+  it("stops outstanding fetch and all retries when Claude disconnects", async () => {
+    await credentials();
+    let started!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    fetchMock.mockImplementation((_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(new DOMException("cancelled", "AbortError")), { once: true });
+      started();
+    }));
+    const raw = Object.assign(new EventEmitter(), { destroyed: false, writableEnded: false,
+      write: vi.fn(), end: vi.fn() });
+    const pending = chatCodexOAuth({ raw } as unknown as FastifyReply,
+      { model: "gpt-6.1-sol", stream: true, messages: [{ role: "user", content: "synthetic prompt" }] }, "gpt-6.1-sol");
+    await entered;
+    raw.destroyed = true;
+    raw.emit("close");
+    await pending;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(raw.write).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(true);
+  });
+});
