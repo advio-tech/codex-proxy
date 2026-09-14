@@ -425,3 +425,67 @@ describe("VPN recovery", () => {
     expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(true);
   });
 });
+
+describe("gateway Responses history replay", () => {
+  it.each([false, true])("keeps complete output across three concurrent sessions (missing completed output: %s)", async (emptyCompletedOutput) => {
+    await credentials();
+    app = createGateway();
+    const rounds = new Map<string, number>();
+    const sent = new Map<string, any[]>();
+    fetchMock.mockImplementation(async (_url: string, init: RequestInit) => {
+      const req = JSON.parse(init.body as string);
+      const id = req.prompt_cache_key;
+      const round = (rounds.get(id) || 0) + 1;
+      rounds.set(id, round);
+      const records = sent.get(id) || []; records.push(req); sent.set(id, records);
+      const out = [
+        { type: "reasoning", id: `rs-${id}-${round}`, summary: [], encrypted_content: `${id}-${round}` },
+        { type: "message", id: `msg-${id}-${round}`, role: "assistant", phase: "final_answer",
+          content: [{ type: "output_text", text: `answer ${round}`, annotations: [] }] },
+      ];
+      return sse([
+        ...out.map((item) => ({ type: "response.output_item.done", item })),
+        { type: "response.completed", response: { output: emptyCompletedOutput ? undefined : out, usage: { input_tokens: 20, output_tokens: 4 } } },
+      ]);
+    });
+    const histories = new Map<string, any[]>(["a", "b", "c"].map((id) => [id, [{ role: "user", content: "same shared brief" }]]));
+    for (let round = 1; round <= 3; round++) {
+      await Promise.all([...histories].map(async ([id, messages]) => {
+        const response = await app!.inject({ method: "POST", url: "/v1/messages", payload: {
+          model: "codex-oauth:gpt-6.1-sol@medium", stream: false, messages,
+          metadata: { user_id: JSON.stringify({ session_id: `integration-${id}` }) },
+        } });
+        expect(response.statusCode).toBe(200);
+        expect(response.json().content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")).toBe(`answer ${round}`);
+        messages.push({ role: "assistant", content: [{ type: "text", text: `answer ${round}` }] }, { role: "user", content: `next ${round}` });
+      }));
+    }
+    expect(sent.size).toBe(3);
+    for (const [id, records] of sent) {
+      expect(records).toHaveLength(3);
+      for (let i = 0; i < records.length; i++) {
+        expect(records[i].reasoning.effort).toBe("medium");
+        expect(records[i].input.filter((item: any) => item.type === "reasoning").map((item: any) => item.encrypted_content))
+          .toEqual(Array.from({ length: i }, (_, r) => `${id}-${r + 1}`));
+        if (i) expect(records[i].input.slice(0, records[i - 1].input.length)).toEqual(records[i - 1].input);
+      }
+    }
+  });
+  it("does not save reasoning from an interrupted response", async () => {
+    await credentials(); app = createGateway();
+    vi.stubEnv("CCX_NETWORK_RETRIES", "0");
+    const payload = { model: "codex-oauth:gpt-6.1-sol@medium", stream: false,
+      metadata: { user_id: JSON.stringify({ session_id: "interrupted-integration" }) },
+      messages: [{ role: "user", content: "start" }] };
+    fetchMock.mockResolvedValue(sse([{ type: "response.output_item.done", item: {
+      type: "reasoning", summary: [], encrypted_content: "incomplete-secret" } }]));
+    await app.inject({ method: "POST", url: "/v1/messages", payload });
+    fetchMock.mockResolvedValue(sse([{ type: "response.completed", response: { output: [], usage: {} } }]));
+    await app.inject({ method: "POST", url: "/v1/messages", payload: { ...payload,
+      messages: [...payload.messages, { role: "assistant", content: "partial" }, { role: "user", content: "continue" }] } });
+    const last = JSON.parse(fetchMock.mock.calls.at(-1)![1].body);
+    expect(last.input.some((item: any) => item.type === "reasoning")).toBe(false);
+  });
+});
+
+// Protocol regressions recreated from the independent Flow review and local event handlers.
