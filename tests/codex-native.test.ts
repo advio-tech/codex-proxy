@@ -489,3 +489,273 @@ describe("gateway Responses history replay", () => {
 });
 
 // Protocol regressions recreated from the independent Flow review and local event handlers.
+describe("completed output protocol regressions", () => {
+  function eventsFrom(body: string) {
+    return body.split("\n").filter(line => line.startsWith("data: ")).map(line => JSON.parse(line.slice(6)));
+  }
+  async function run(events: object[], stream: boolean, extra: object = {}, status = 200) {
+    await credentials();
+    app ||= createGateway();
+    fetchMock.mockImplementation(async (url: string, init: RequestInit) => {
+      expect(url).toBe("https://chatgpt.com/backend-api/codex/responses");
+      expect(init.redirect).toBe("error");
+      return sse(events);
+    });
+    const response = await app.inject({ method: "POST", url: "/v1/messages", payload: {
+      model: "codex-oauth:gpt-6.1-sol@medium", stream,
+      messages: [{ role: "user", content: "synthetic protocol fixture" }],
+      tools: [{ name: "Bash", input_schema: { type: "object" } }], ...extra,
+    } });
+    expect(response.statusCode).toBe(status);
+    return response;
+  }
+  const call = { type: "function_call", id: "fc-regression", call_id: "call-regression", name: "Bash",
+    arguments: '{"command":"echo synthetic","nested":{"count":2},"enabled":false}' };
+  const expectedInput = { command: "echo synthetic", nested: { count: 2 }, enabled: false };
+  const toolVariants = ["no-delta", "initial-only", "initial-partial", "arguments-done", "partial-delta", "full-deltas", "item-done-only", "added-completed-only", "completed-only"] as const;
+  for (const stream of [false, true]) {
+    it.each(toolVariants)(`tool arguments fallback preserves exact input once (stream=${stream}, %s)`, async variant => {
+      const events: object[] = [];
+      if (variant !== "completed-only") {
+        if (variant !== "item-done-only") events.push({ type: "response.output_item.added", item: { ...call,
+          arguments: variant === "initial-only" || variant === "initial-partial" || variant === "full-deltas" ? call.arguments : "" } });
+        if (variant === "partial-delta" || variant === "initial-partial" || variant === "full-deltas") {
+          events.push({ type: "response.function_call_arguments.delta", item_id: call.id, delta: call.arguments.slice(0, 18) });
+          if (variant === "full-deltas") events.push({ type: "response.function_call_arguments.delta", item_id: call.id, delta: call.arguments.slice(18) });
+        }
+        if (variant === "arguments-done") events.push({ type: "response.function_call_arguments.done", item_id: call.id, arguments: call.arguments });
+        if (variant !== "added-completed-only") events.push({ type: "response.output_item.done", item: variant === "initial-only" || variant === "initial-partial" || variant === "arguments-done"
+          ? { type: call.type, id: call.id } : call });
+      }
+      events.push({ type: "response.completed", response: { output: [call] } });
+      const response = await run(events, stream);
+      if (!stream) {
+        expect(response.json().content).toEqual([{ type: "tool_use", id: call.call_id, name: call.name, input: expectedInput }]);
+        expect(response.json().stop_reason).toBe("tool_use");
+      } else {
+        const out = eventsFrom(response.body);
+        const starts = out.filter(e => e.content_block?.type === "tool_use");
+        expect(starts).toHaveLength(1);
+        expect(starts[0].content_block).toEqual({ type: "tool_use", id: call.call_id, name: call.name, input: {} });
+        expect(out.filter(e => e.type === "content_block_stop" && e.index === starts[0].index)).toHaveLength(1);
+        const args = out.filter(e => e.delta?.type === "input_json_delta").map(e => e.delta.partial_json).join("");
+        expect(args).toBe(call.arguments);
+        expect(JSON.parse(args)).toEqual(expectedInput);
+        expect(out.filter(e => e.type === "message_stop")).toHaveLength(1);
+      }
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["items", "completed-only", "partial-stream", "full-stream", "part-done"])(`all message blocks survive fallback (stream=${stream}, %s)`, async variant => {
+      const messages = [
+        { type: "message", id: "msg-one", role: "assistant", content: [{ type: "output_text", text: "first " }, { type: "output_text", text: "block; " }] },
+        { type: "message", id: "msg-two", role: "assistant", content: [{ type: "output_text", text: "second " }, { type: "output_text", text: "block" }] },
+      ];
+      const expected = "first block; second block";
+      const events: object[] = [];
+      if (variant === "partial-stream" || variant === "full-stream") events.push({ type: "response.output_text.delta", delta: variant === "partial-stream" ? "fir" : expected });
+      if (variant === "part-done") events.push({ type: "response.content_part.done", part: messages[0].content[0] });
+      if (variant !== "completed-only") events.push(...messages.map(item => ({ type: "response.output_item.done", item })));
+      events.push({ type: "response.completed", response: { output: messages } });
+      const response = await run(events, stream);
+      const actual = stream ? eventsFrom(response.body).filter(e => e.delta?.type === "text_delta").map(e => e.delta.text).join("")
+        : response.json().content.map((b: any) => b.text).join("");
+      expect(actual).toBe(expected);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["second-partial", "first-partial", "both-partial", "interleaved-tool", "missing-completed-output"])(`canonical completed output recovers missing item text (stream=${stream}, %s)`, async variant => {
+      const first = { type: "message", id: "first", role: "assistant", content: [{ type: "output_text", text: "first;" }] };
+      const second = { type: "message", id: "second", role: "assistant", content: [{ type: "output_text", text: "second" }] };
+      const events: object[] = [];
+      if (variant !== "second-partial") events.push({ type: "response.output_text.delta", item_id: "first", output_index: 0, delta: "fir" });
+      if (variant === "interleaved-tool") events.push({ type: "response.output_item.added", output_index: 1, item: call }, { type: "response.output_item.done", output_index: 1, item: call });
+      if (variant !== "first-partial") events.push({ type: "response.output_text.delta", item_id: "second", output_index: variant === "interleaved-tool" ? 2 : 1, delta: "sec" });
+      if (variant === "missing-completed-output") events.push({ type: "response.output_item.done", output_index: 0, item: first }, { type: "response.output_item.done", output_index: 1, item: second });
+      events.push({ type: "response.completed", response: variant === "missing-completed-output" ? {} : { output: variant === "interleaved-tool" ? [first, call, second] : [first, second] } });
+      const response = await run(events, stream);
+      const content = stream ? clientContent(response.body) : response.json().content;
+      expect(content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")).toBe("first;second");
+      if (variant === "interleaved-tool") expect(content).toEqual([{ type: "text", text: "first;" }, { type: "tool_use", id: call.call_id, name: call.name, input: expectedInput }, { type: "text", text: "second" }]);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["initial", "delta", "arguments-done", "delta-done", "tool-done", "trailing-text", "empty-output"])(`missing output retains observed tool coverage (stream=${stream}, %s)`, async variant => {
+      const first = { type: "message", id: "coverage-first", role: "assistant", content: [{ type: "output_text", text: "first;" }] };
+      const exactCall = { ...call, arguments: '{ "command": "echo synthetic", "nested": { "count": 2 }, "enabled": false }' };
+      const events: object[] = [
+        { type: "response.output_item.done", output_index: 0, item: first },
+        { type: "response.output_item.added", output_index: 1, item: { ...exactCall, arguments: variant === "initial" || variant === "trailing-text" || variant === "empty-output" ? exactCall.arguments : "" } },
+      ];
+      if (variant === "delta" || variant === "delta-done") events.push({ type: "response.function_call_arguments.delta", item_id: call.id, delta: exactCall.arguments });
+      if (variant === "arguments-done" || variant === "delta-done") events.push({ type: "response.function_call_arguments.done", item_id: call.id, arguments: exactCall.arguments });
+      if (variant === "tool-done") events.push({ type: "response.output_item.done", output_index: 1, item: exactCall });
+      if (variant === "trailing-text") events.push({ type: "response.output_text.delta", output_index: 2, item_id: "coverage-after", delta: "after" });
+      events.push({ type: "response.completed", response: variant === "empty-output" ? { output: [] } : {} });
+      const response = await run(events, stream);
+      const content = stream ? clientContent(response.body) : response.json().content;
+      expect(content).toEqual(variant === "empty-output" ? [] : [
+        { type: "text", text: "first;" },
+        { type: "tool_use", id: call.call_id, name: call.name, input: expectedInput },
+        ...(variant === "trailing-text" ? [{ type: "text", text: "after" }] : []),
+      ]);
+      const stop = stream ? eventsFrom(response.body).find(e => e.type === "message_delta").delta.stop_reason : response.json().stop_reason;
+      expect(stop).toBe(variant === "empty-output" ? "end_turn" : "tool_use");
+      if (stream && variant !== "empty-output") {
+        const out = eventsFrom(response.body);
+        expect(out.filter(e => e.content_block?.type === "tool_use")).toHaveLength(1);
+        expect(out.filter(e => e.delta?.type === "input_json_delta").map(e => e.delta.partial_json).join("")).toBe(exactCall.arguments);
+      }
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it(`retains observed text around a tool when canonical item order cannot represent it (stream=${stream})`, async () => {
+      const message = { type: "message", id: "coverage-split", role: "assistant", content: [{ type: "output_text", text: "beforeafter" }] };
+      const response = await run([
+        { type: "response.output_text.delta", item_id: message.id, output_index: 0, delta: "before" },
+        { type: "response.output_item.added", output_index: 1, item: call },
+        { type: "response.output_text.delta", item_id: message.id, output_index: 0, delta: "after" },
+        { type: "response.output_item.done", output_index: 0, item: message },
+        { type: "response.output_item.done", output_index: 1, item: call },
+        { type: "response.completed", response: {} },
+      ], stream);
+      expect(stream ? clientContent(response.body) : response.json().content).toEqual([
+        { type: "text", text: "before" }, { type: "tool_use", id: call.call_id, name: call.name, input: expectedInput }, { type: "text", text: "after" },
+      ]);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["delta-only", "empty-output", "missing-output"])(`completed text boundary remains explicit (stream=${stream}, %s)`, async variant => {
+      const events: object[] = [{ type: "response.output_text.delta", item_id: "second", output_index: 1, delta: "sec" }];
+      if (variant === "missing-output") events.push({ type: "response.output_text.delta", item_id: "second", output_index: 1, delta: "ond" });
+      events.push({ type: "response.completed", response: variant === "empty-output" ? { output: [] } : {} });
+      const response = await run(events, stream);
+      const content = stream ? clientContent(response.body) : response.json().content;
+      expect(content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")).toBe(variant === "empty-output" ? "" : variant === "missing-output" ? "second" : "sec");
+    });
+
+    it(`discards an incomplete attempt before canonical text/tool reconstruction (stream=${stream})`, async () => {
+      await credentials(); app = createGateway();
+      vi.stubEnv("CCX_NETWORK_RETRIES", "1");
+      vi.stubEnv("CCX_NETWORK_RETRY_DELAY_MS", "1");
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const first = { type: "message", id: "first", role: "assistant", content: [{ type: "output_text", text: "first;" }] };
+      const second = { type: "message", id: "second", role: "assistant", content: [{ type: "output_text", text: "second" }] };
+      fetchMock.mockResolvedValueOnce(sse([{ type: "response.output_text.delta", item_id: "second", output_index: 2, delta: "discarded" },
+        { type: "response.output_item.added", item: call }, { type: "response.output_item.done", item: call }]));
+      fetchMock.mockResolvedValueOnce(sse([{ type: "response.output_text.delta", item_id: "second", output_index: 2, delta: "sec" },
+        { type: "response.output_item.added", item: call }, { type: "response.output_item.done", item: call },
+        { type: "response.completed", response: { output: [first, call, second], usage: { input_tokens: 12, output_tokens: 4, input_tokens_details: { cached_tokens: 3 } } } }]));
+      const response = await app.inject({ method: "POST", url: "/v1/messages", payload: { model: "codex", stream, messages: [] } });
+      expect(response.statusCode).toBe(200);
+      const content = stream ? clientContent(response.body) : response.json().content;
+      expect(content).toEqual([{ type: "text", text: "first;" }, { type: "tool_use", id: call.call_id, name: call.name, input: expectedInput }, { type: "text", text: "second" }]);
+      expect(response.body).not.toContain("discarded");
+      const usage = stream ? eventsFrom(response.body).find(e => e.type === "message_delta").usage : response.json().usage;
+      expect(usage).toMatchObject({ input_tokens: 9, output_tokens: 4, cache_read_input_tokens: 3 });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it.each(["WebSearch", "WebFetch", "Bash", "auto", "none", "any"])(`native search reconciles exact upstream choice (stream=${stream}, %s)`, async choice => {
+      const toolChoice = ["auto", "none", "any"].includes(choice) ? { type: choice } : { type: "tool", name: choice };
+      await run([{ type: "response.completed", response: { output: [] } }], stream, {
+        tools: [{ name: "WebSearch" }, { name: "Bash", input_schema: { type: "object" } }, { name: "WebFetch" }], tool_choice: toolChoice,
+      });
+      const sent = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(sent.tools).toEqual([{ type: "function", name: "Bash", description: "", strict: false, parameters: { type: "object" } }, { type: "web_search" }]);
+      expect(sent.tool_choice).toEqual(choice === "WebSearch" || choice === "WebFetch" ? { type: "web_search" }
+        : choice === "Bash" ? { type: "function", name: "Bash" } : choice === "any" ? "required" : choice);
+      expect(sent.instructions).toContain("Use native server-side web search when needed.");
+      if (sent.tool_choice.type === "function") expect(sent.tools.some((t: any) => t.type === "function" && t.name === sent.tool_choice.name)).toBe(true);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it(`rejects missing forced functions locally (stream=${stream})`, async () => {
+      await credentials(); app = createGateway();
+      const response = await app.inject({ method: "POST", url: "/v1/messages", payload: {
+        model: "codex", stream, messages: [], tools: [{ name: "Bash" }], tool_choice: { type: "tool", name: "Missing" },
+      } });
+      expect(response.statusCode).toBe(400);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+  }
+
+  it.each([false, true])("keeps original reasoning and actual client text/tool output in replay (stream=%s)", async stream => {
+    const output = [
+      { type: "reasoning", id: "reasoning-protocol", summary: [], encrypted_content: "synthetic-encrypted" },
+      { type: "message", role: "assistant", id: "before-tool", content: [{ type: "output_text", text: "before" }] },
+      call,
+      { type: "message", role: "assistant", id: "after-tool", content: [{ type: "output_text", text: "after" }] },
+    ];
+    const metadata = { user_id: JSON.stringify({ session_id: "protocol-original-output" }) };
+    const response = await run([{ type: "response.completed", response: { output } }], stream, { metadata });
+    const content = stream ? clientContent(response.body) : response.json().content;
+    expect(content).toEqual([
+      { type: "text", text: "before" }, { type: "tool_use", id: call.call_id, name: call.name, input: expectedInput }, { type: "text", text: "after" },
+    ]);
+    await app!.inject({ method: "POST", url: "/v1/messages", payload: { model: "claude-sonnet-4-6@medium", stream: false, metadata,
+      messages: [{ role: "user", content: "synthetic protocol fixture" },
+        { role: "assistant", content },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: call.call_id, content: "synthetic result" }] }] } });
+    const replay = JSON.parse(fetchMock.mock.calls[1][1].body).input;
+    expect(replay.slice(1, 1 + output.length)).toEqual(output);
+  });
+
+  it.each([false, true])("serves native forced search on an owned dynamic loopback port (stream=%s)", async stream => {
+    await credentials(); app = createGateway();
+    fetchMock.mockImplementation(async () => sse([{ type: "response.completed", response: { output: [] } }]));
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const address = app.server.address();
+    if (!address || typeof address === "string") throw new Error("Expected an owned loopback port");
+    const result = await new Promise<{ status: number | undefined; body: string }>((resolve, reject) => {
+      const req = loopbackRequest({ hostname: "127.0.0.1", port: address.port, path: "/v1/messages", method: "POST",
+        headers: { "content-type": "application/json" } }, res => {
+        let body = "";
+        res.setEncoding("utf8"); res.on("data", chunk => { body += chunk; });
+        res.on("end", () => resolve({ status: res.statusCode, body }));
+      });
+      req.on("error", reject);
+      req.end(JSON.stringify({ model: "codex", stream, messages: [], tools: [{ name: "WebSearch" }], tool_choice: { type: "tool", name: "WebSearch" } }));
+    });
+    expect(result.status).toBe(200);
+    expect(stream ? eventsFrom(result.body).at(-1).type : JSON.parse(result.body).stop_reason).toBe(stream ? "message_stop" : "end_turn");
+    const sent = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(sent.tools).toEqual([{ type: "web_search" }]);
+    expect(sent.tool_choice).toEqual({ type: "web_search" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])("preserves call-id fallback and ordered distinct calls (stream=%s)", async stream => {
+    const output = [call, { ...call, id: undefined, call_id: "call-second", name: "Read", arguments: '{"path":"synthetic.txt"}' }];
+    const response = await run([{ type: "response.completed", response: { output } }], stream);
+    if (stream) {
+      const starts = eventsFrom(response.body).filter(e => e.content_block?.type === "tool_use");
+      expect(starts.map(e => [e.content_block.id, e.content_block.name, e.index])).toEqual([[call.call_id, "Bash", 0], ["call-second", "Read", 1]]);
+    } else expect(response.json().content).toEqual([
+      { type: "tool_use", id: call.call_id, name: "Bash", input: expectedInput },
+      { type: "tool_use", id: "call-second", name: "Read", input: { path: "synthetic.txt" } },
+    ]);
+  });
+
+  it.each(['{"synthetic-private-argument":', '[]', 'null', '"synthetic-private-argument"'])("invalid completed-only arguments return nonstream error safely (%s)", async argumentsText => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const response = await run([{ type: "response.completed", response: { output: [{ ...call, arguments: argumentsText }] } }], false, {}, 503);
+    expect(response.json()).toMatchObject({ type: "error", error: { type: "api_error" } });
+    expect(response.body).not.toContain("synthetic-private-argument");
+    expect(response.body).not.toContain("tool_use");
+    expect(JSON.stringify(error.mock.calls)).not.toContain("synthetic-private-argument");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['{"synthetic-private-argument":', '[]', 'null', '"synthetic-private-argument"'])("invalid serialized arguments fail safely (%s)", async argumentsText => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const response = await run([{ type: "response.output_item.added", item: { ...call, arguments: "" } },
+      { type: "response.output_item.done", item: { ...call, arguments: argumentsText } },
+      { type: "response.completed", response: {} }], true);
+    expect(response.body).toContain("event: error");
+    expect(response.body).not.toContain("synthetic-private-argument");
+    expect(response.body).not.toContain("event: message_stop");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain("synthetic-private-argument");
+  });
+});
