@@ -570,6 +570,10 @@ async function chatCodexOAuthInner(
     "OpenAI-Beta": "responses=experimental",
   };
   if (installId) headers["x-codex-installation-id"] = installId;
+  if (convoKey) {
+    headers.session_id = promptCacheKey;
+    headers["session-id"] = promptCacheKey;
+  }
   if (credentials.account_id) headers["ChatGPT-Account-ID"] = credentials.account_id;
 
   const reqJson = JSON.stringify(reqBody);
