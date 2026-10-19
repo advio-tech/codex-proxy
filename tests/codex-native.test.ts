@@ -512,6 +512,7 @@ describe("completed output protocol regressions", () => {
   const call = { type: "function_call", id: "fc-regression", call_id: "call-regression", name: "Bash",
     arguments: '{"command":"echo synthetic","nested":{"count":2},"enabled":false}' };
   const expectedInput = { command: "echo synthetic", nested: { count: 2 }, enabled: false };
+  const reasoning = { type: "reasoning", id: "rs-regression", summary: [], encrypted_content: "synthetic-encrypted-reasoning" };
   const toolVariants = ["no-delta", "initial-only", "initial-partial", "arguments-done", "partial-delta", "full-deltas", "item-done-only", "added-completed-only", "completed-only"] as const;
   for (const stream of [false, true]) {
     it.each(toolVariants)(`tool arguments fallback preserves exact input once (stream=${stream}, %s)`, async variant => {
@@ -580,7 +581,8 @@ describe("completed output protocol regressions", () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
-    it.each(["initial", "delta", "arguments-done", "delta-done", "tool-done", "trailing-text", "empty-output"])(`missing output retains observed tool coverage (stream=${stream}, %s)`, async variant => {
+    it.each(["initial", "delta", "arguments-done", "delta-done", "tool-done", "trailing-text", "empty-output"]
+      .flatMap(variant => [false, true].map(reasoningOnly => ({ variant, reasoningOnly }))))(`missing output retains observed tool coverage (stream=${stream}, $variant, reasoning-only=$reasoningOnly)`, async ({ variant, reasoningOnly }) => {
       const first = { type: "message", id: "coverage-first", role: "assistant", content: [{ type: "output_text", text: "first;" }] };
       const exactCall = { ...call, arguments: '{ "command": "echo synthetic", "nested": { "count": 2 }, "enabled": false }' };
       const events: object[] = [
@@ -591,7 +593,7 @@ describe("completed output protocol regressions", () => {
       if (variant === "arguments-done" || variant === "delta-done") events.push({ type: "response.function_call_arguments.done", item_id: call.id, arguments: exactCall.arguments });
       if (variant === "tool-done") events.push({ type: "response.output_item.done", output_index: 1, item: exactCall });
       if (variant === "trailing-text") events.push({ type: "response.output_text.delta", output_index: 2, item_id: "coverage-after", delta: "after" });
-      events.push({ type: "response.completed", response: variant === "empty-output" ? { output: [] } : {} });
+      events.push({ type: "response.completed", response: reasoningOnly ? { output: [reasoning] } : variant === "empty-output" ? { output: [] } : {} });
       const response = await run(events, stream);
       const content = stream ? clientContent(response.body) : response.json().content;
       expect(content).toEqual([
@@ -609,7 +611,7 @@ describe("completed output protocol regressions", () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
-    it(`retains observed text around a tool when canonical item order cannot represent it (stream=${stream})`, async () => {
+    it.each([false, true])(`retains observed text around a tool when canonical item order cannot represent it (stream=${stream}, reasoning-only=%s)`, async reasoningOnly => {
       const message = { type: "message", id: "coverage-split", role: "assistant", content: [{ type: "output_text", text: "beforeafter" }] };
       const response = await run([
         { type: "response.output_text.delta", item_id: message.id, output_index: 0, delta: "before" },
@@ -617,7 +619,7 @@ describe("completed output protocol regressions", () => {
         { type: "response.output_text.delta", item_id: message.id, output_index: 0, delta: "after" },
         { type: "response.output_item.done", output_index: 0, item: message },
         { type: "response.output_item.done", output_index: 1, item: call },
-        { type: "response.completed", response: {} },
+        { type: "response.completed", response: reasoningOnly ? { output: [reasoning] } : {} },
       ], stream);
       expect(stream ? clientContent(response.body) : response.json().content).toEqual([
         { type: "text", text: "before" }, { type: "tool_use", id: call.call_id, name: call.name, input: expectedInput }, { type: "text", text: "after" },
@@ -634,7 +636,8 @@ describe("completed output protocol regressions", () => {
       expect(content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")).toBe(variant === "missing-output" ? "second" : "sec");
     });
 
-    it.each(["deltas-and-items", "items-only", "deltas-only", "with-tool"])(`preserves native output when completed output is empty (stream=${stream}, %s)`, async variant => {
+    it.each(["deltas-and-items", "items-only", "deltas-only", "with-tool"]
+      .flatMap(variant => [false, true].map(reasoningOnly => ({ variant, reasoningOnly }))))(`preserves native output when completed output is empty or reasoning-only (stream=${stream}, $variant, reasoning-only=$reasoningOnly)`, async ({ variant, reasoningOnly }) => {
       const reasoning = { type: "reasoning", id: "rs-empty-terminal", summary: [], encrypted_content: "synthetic-empty-terminal-reasoning" };
       const message = { type: "message", id: "msg-empty-terminal", role: "assistant", content: [{ type: "output_text", text: "ok" }] };
       const events: object[] = [
@@ -647,7 +650,7 @@ describe("completed output protocol regressions", () => {
         { type: "response.output_text.done", item_id: message.id, output_index: 1, text: "ok" });
       if (variant !== "deltas-only") events.push({ type: "response.output_item.done", output_index: 1, item: message });
       if (variant === "with-tool") events.push({ type: "response.output_item.done", output_index: 2, item: call });
-      events.push({ type: "response.completed", response: { output: [], usage: {
+      events.push({ type: "response.completed", response: { output: reasoningOnly ? [reasoning] : [], usage: {
         input_tokens: 12, output_tokens: 4, input_tokens_details: { cached_tokens: 3 },
       } } });
       const response = await run(events, stream);
@@ -660,6 +663,38 @@ describe("completed output protocol regressions", () => {
       const usage = stream ? outputEvents.find(e => e.type === "message_delta").usage : response.json().usage;
       expect(usage).toMatchObject({ input_tokens: 9, output_tokens: 4, cache_read_input_tokens: 3 });
       if (stream) expect(outputEvents.filter(e => e.type === "message_stop")).toHaveLength(1);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["corrected-text", "empty-message", "tool-only", "corrected-tool-order"])(`keeps complete terminal output authoritative (stream=${stream}, %s)`, async variant => {
+      const draft = { type: "message", id: "msg-correction", role: "assistant", content: [{ type: "output_text", text: "draft" }] };
+      const final = { ...draft, content: [{ type: "output_text", text: variant === "empty-message" ? "" : "final" }] };
+      const correctedCall = { ...call, arguments: '{"command":"corrected"}' };
+      const output = variant === "tool-only" ? [call] : variant === "corrected-tool-order" ? [correctedCall, final] : [final];
+      const response = await run([
+        { type: "response.output_text.delta", item_id: draft.id, output_index: 0, delta: "draft" },
+        { type: "response.output_item.done", output_index: 0, item: draft },
+        { type: "response.output_item.done", output_index: 1, item: call },
+        { type: "response.completed", response: { output } },
+      ], stream);
+      const content = stream ? clientContent(response.body) : response.json().content;
+      expect(content).toEqual(variant === "tool-only" ? [{ type: "tool_use", id: call.call_id, name: call.name, input: expectedInput }]
+        : variant === "corrected-tool-order" ? [
+          { type: "tool_use", id: call.call_id, name: call.name, input: { command: "corrected" } }, { type: "text", text: "final" },
+        ] : variant === "empty-message" ? [] : [{ type: "text", text: "final" }]);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it(`keeps genuine reasoning-only output textless (stream=${stream})`, async () => {
+      const response = await run([
+        { type: "response.reasoning_summary_text.delta", delta: "Synthetic reasoning" },
+        { type: "response.completed", response: { output: [reasoning] } },
+      ], stream);
+      expect(stream ? clientContent(response.body) : response.json().content).toEqual([
+        { type: "thinking", thinking: "Synthetic reasoning" },
+      ]);
+      const stop = stream ? eventsFrom(response.body).find(e => e.type === "message_delta").delta.stop_reason : response.json().stop_reason;
+      expect(stop).toBe("end_turn");
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
@@ -709,15 +744,20 @@ describe("completed output protocol regressions", () => {
     });
   }
 
-  it.each([false, true])("keeps original reasoning and actual client text/tool output in replay (stream=%s)", async stream => {
+  it.each([false, true].flatMap(stream => ["complete", "terminal-only", "updated"].map(variant => ({ stream, variant }))))("keeps original reasoning and actual client text/tool output in replay (stream=$stream, $variant)", async ({ stream, variant }) => {
     const output = [
       { type: "reasoning", id: "reasoning-protocol", summary: [], encrypted_content: "synthetic-encrypted" },
       { type: "message", role: "assistant", id: "before-tool", content: [{ type: "output_text", text: "before" }] },
       call,
       { type: "message", role: "assistant", id: "after-tool", content: [{ type: "output_text", text: "after" }] },
     ];
-    const metadata = { user_id: JSON.stringify({ session_id: "protocol-original-output" }) };
-    const response = await run([{ type: "response.completed", response: { output } }], stream, { metadata });
+    if (variant === "updated") [output[0], output[1]] = [output[1], output[0]];
+    const metadata = { user_id: JSON.stringify({ session_id: `protocol-original-output-${variant}` }) };
+    const events: object[] = variant === "complete" ? [] : output.flatMap((item, output_index) =>
+      item.type === "reasoning" && variant === "terminal-only" ? [] : [{ type: "response.output_item.done", output_index,
+        item: item.type === "reasoning" ? { ...item, encrypted_content: "synthetic-old-encrypted" } : item }]);
+    events.push({ type: "response.completed", response: { output: variant === "complete" ? output : output.filter(item => item.type === "reasoning") } });
+    const response = await run(events, stream, { metadata });
     const content = stream ? clientContent(response.body) : response.json().content;
     expect(content).toEqual([
       { type: "text", text: "before" }, { type: "tool_use", id: call.call_id, name: call.name, input: expectedInput }, { type: "text", text: "after" },

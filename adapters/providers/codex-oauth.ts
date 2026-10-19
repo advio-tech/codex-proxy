@@ -819,8 +819,15 @@ async function pumpResponsesStream(
         const item = json.item as ResponseItem;
         doneItems.push({ index: typeof json.output_index === "number" ? json.output_index : doneItems.length, item });
       }
+      let terminalReasoning: ResponseItem[] | undefined;
       if (json.type === "response.completed") {
         const response = (json.response ?? {}) as { output?: ResponseItem[] };
+        // Reasoning alone cannot replace text or tools already received.
+        if (Array.isArray(response.output) && response.output.length > 0
+          && response.output.every(item => item.type === "reasoning") && (s.textChars > 0 || s.toolCalls > 0)) {
+          terminalReasoning = response.output;
+          delete response.output;
+        }
         // Native Codex can finish with output: [] after sending complete text
         // and tool items. Treat that empty terminal list like a missing list so
         // it cannot erase output already received during this successful attempt.
@@ -878,6 +885,18 @@ async function pumpResponsesStream(
       }
       if (typeof json.type === "string" && json.type.startsWith("response.reasoning")) reasoningEvents.push(json);
       handleEvent(res, s, model, json);
+      if (terminalReasoning) {
+        // Preserve final encrypted reasoning for replay without re-emitting output.
+        const additional: ResponseItem[] = [];
+        for (const item of terminalReasoning) {
+          const id = (item as { id?: string }).id;
+          const index = s.responseOutput.findIndex(previous => previous.type === "reasoning"
+            && (id ? (previous as { id?: string }).id === id : JSON.stringify(previous) === JSON.stringify(item)));
+          if (index < 0) additional.push(item);
+          else s.responseOutput[index] = item;
+        }
+        s.responseOutput.unshift(...additional);
+      }
       if (json.type === "response.completed") completed = true;
     },
   });
