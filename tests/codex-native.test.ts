@@ -594,14 +594,14 @@ describe("completed output protocol regressions", () => {
       events.push({ type: "response.completed", response: variant === "empty-output" ? { output: [] } : {} });
       const response = await run(events, stream);
       const content = stream ? clientContent(response.body) : response.json().content;
-      expect(content).toEqual(variant === "empty-output" ? [] : [
+      expect(content).toEqual([
         { type: "text", text: "first;" },
         { type: "tool_use", id: call.call_id, name: call.name, input: expectedInput },
         ...(variant === "trailing-text" ? [{ type: "text", text: "after" }] : []),
       ]);
       const stop = stream ? eventsFrom(response.body).find(e => e.type === "message_delta").delta.stop_reason : response.json().stop_reason;
-      expect(stop).toBe(variant === "empty-output" ? "end_turn" : "tool_use");
-      if (stream && variant !== "empty-output") {
+      expect(stop).toBe("tool_use");
+      if (stream) {
         const out = eventsFrom(response.body);
         expect(out.filter(e => e.content_block?.type === "tool_use")).toHaveLength(1);
         expect(out.filter(e => e.delta?.type === "input_json_delta").map(e => e.delta.partial_json).join("")).toBe(exactCall.arguments);
@@ -631,7 +631,36 @@ describe("completed output protocol regressions", () => {
       events.push({ type: "response.completed", response: variant === "empty-output" ? { output: [] } : {} });
       const response = await run(events, stream);
       const content = stream ? clientContent(response.body) : response.json().content;
-      expect(content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")).toBe(variant === "empty-output" ? "" : variant === "missing-output" ? "second" : "sec");
+      expect(content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")).toBe(variant === "missing-output" ? "second" : "sec");
+    });
+
+    it.each(["deltas-and-items", "items-only", "deltas-only", "with-tool"])(`preserves native output when completed output is empty (stream=${stream}, %s)`, async variant => {
+      const reasoning = { type: "reasoning", id: "rs-empty-terminal", summary: [], encrypted_content: "synthetic-empty-terminal-reasoning" };
+      const message = { type: "message", id: "msg-empty-terminal", role: "assistant", content: [{ type: "output_text", text: "ok" }] };
+      const events: object[] = [
+        { type: "response.created", response: { output: [] } },
+        { type: "response.reasoning_summary_text.delta", delta: "Synthetic reasoning" },
+        { type: "response.output_item.done", output_index: 0, item: reasoning },
+      ];
+      if (variant !== "items-only") events.push(
+        { type: "response.output_text.delta", item_id: message.id, output_index: 1, delta: "ok" },
+        { type: "response.output_text.done", item_id: message.id, output_index: 1, text: "ok" });
+      if (variant !== "deltas-only") events.push({ type: "response.output_item.done", output_index: 1, item: message });
+      if (variant === "with-tool") events.push({ type: "response.output_item.done", output_index: 2, item: call });
+      events.push({ type: "response.completed", response: { output: [], usage: {
+        input_tokens: 12, output_tokens: 4, input_tokens_details: { cached_tokens: 3 },
+      } } });
+      const response = await run(events, stream);
+      const content = stream ? clientContent(response.body) : response.json().content;
+      expect(content).toEqual([
+        { type: "thinking", thinking: "Synthetic reasoning" }, { type: "text", text: "ok" },
+        ...(variant === "with-tool" ? [{ type: "tool_use", id: call.call_id, name: call.name, input: expectedInput }] : []),
+      ]);
+      const outputEvents = stream ? eventsFrom(response.body) : [];
+      const usage = stream ? outputEvents.find(e => e.type === "message_delta").usage : response.json().usage;
+      expect(usage).toMatchObject({ input_tokens: 9, output_tokens: 4, cache_read_input_tokens: 3 });
+      if (stream) expect(outputEvents.filter(e => e.type === "message_stop")).toHaveLength(1);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
     it(`discards an incomplete attempt before canonical text/tool reconstruction (stream=${stream})`, async () => {

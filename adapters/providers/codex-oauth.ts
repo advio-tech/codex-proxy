@@ -821,6 +821,10 @@ async function pumpResponsesStream(
       }
       if (json.type === "response.completed") {
         const response = (json.response ?? {}) as { output?: ResponseItem[] };
+        // Native Codex can finish with output: [] after sending complete text
+        // and tool items. Treat that empty terminal list like a missing list so
+        // it cannot erase output already received during this successful attempt.
+        if (Array.isArray(response.output) && response.output.length === 0) delete response.output;
         const ordered = doneItems.slice().sort((a, b) => a.index - b.index);
         // A missing output is not authoritative. Rebuild only if canonical done
         // items cover every observed text/tool identity, argument prefix and order.
