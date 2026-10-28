@@ -9,6 +9,7 @@ import { createParser } from "eventsource-parser";
 import { FastifyReply } from "fastify";
 import { getCodexCredentials, CodexNativeAuthError } from "../openai-auth.js";
 import { sendEvent } from "../sse.js";
+import { captureCodexRateLimits } from "../codex-rate-limits.js";
 import {
   conversationKey,
   rememberResponse,
@@ -583,6 +584,8 @@ async function chatCodexOAuthInner(
     headers,
     body: reqJson,
   }, 3, diagnostic);
+
+  await captureCodexRateLimits(upstream.headers);
 
   if (diagnostic) {
     diagnostic.phase = "http";
