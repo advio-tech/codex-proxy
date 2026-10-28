@@ -47,6 +47,14 @@ Placeholder нужен клиенту и не служит аутентифик�
 
 Сохраняются text, images, tools, SSE и nonstream ответы. Native web search заменяет WebSearch/WebFetch. Завершённый hidden reasoning хранится в памяти и replay изолирован по session/account/model; перезапуск очищает cache. Ответ буферизуется до завершения, чтобы recovery не дублировал tool execution. По умолчанию network recovery повторяется до отключения клиента; `CCX_NETWORK_RETRIES=0` отключает внешние повторы. Usage разделяет cached и uncached input. Mock-тесты не подтверждают live backend parity.
 
+### Файл окон квоты
+
+При заданном `CODEX_PROXY_RATE_LIMITS_FILE` прокси сохраняет окна квоты из заголовков каждого ответа сервера, включая ответы с ошибкой. Каталог файла должен существовать. Формат: `{"capturedAt":1790000000,"five_hour":{"used_percentage":12.5,"resets_at":1790003600},"seven_day":{"used_percentage":34,"resets_at":1790600000}}`. Время выражено в целых секундах Unix, использование — в процентах от 0 до 100.
+
+Семейство `x-codex-primary-*` задаёт `five_hour` (300 минут), `x-codex-secondary-*` — `seven_day` (10080 минут). Нужны оба окна: `used-percent`, `window-minutes` и `reset-at` либо `reset-after-seconds`. Абсолютный `reset-at` имеет приоритет. Имена абсолютных заголовков соответствуют [исходнику Codex CLI](https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/rate_limits.rs).
+
+Неполные, повреждённые или истёкшие значения, а также другая длительность окна сохраняют прежний файл. Запись идёт через временный файл с правами `0600` в том же каталоге и атомарное переименование. Ошибка записи выводит одну строку без приватных данных и не прерывает ответ клиенту. Без переменной окружения запись отключена. Проверка с настоящим сервером выполняется координатором после обновления образа по разделу «Проверка вживую» документа `agent-runtime/node/docs/окна-подписок.md`.
+
 Проверки выполняются с новыми временными каталогами вне проекта, synthetic credentials и mock fetch:
 
 ```sh
