@@ -23,6 +23,19 @@ function headers() {
     "x-codex-secondary-reset-at": String(now + 604800),
   });
 }
+// Образец разрешённых заголовков настоящего /responses, 28.10.2026 05:03 UTC.
+function liveHeaders() {
+  return new Headers({
+    "x-codex-primary-reset-after-seconds": "435857",
+    "x-codex-primary-reset-at": "1793599678",
+    "x-codex-primary-used-percent": "45",
+    "x-codex-primary-window-minutes": "10080",
+    "x-codex-secondary-reset-after-seconds": "0",
+    "x-codex-secondary-reset-at": "",
+    "x-codex-secondary-used-percent": "0",
+    "x-codex-secondary-window-minutes": "0",
+  });
+}
 const expected = {
   capturedAt: now,
   five_hour: { used_percentage: 12.5, resets_at: now + 3600 },
@@ -95,15 +108,12 @@ describe("Снимок окон квоты", () => {
     ["primary-used-percent", null],
     ["secondary-used-percent", null],
     ["primary-reset-at", null],
-    ["secondary-window-minutes", null],
     ["primary-used-percent", ""],
     ["primary-used-percent", "101"],
     ["secondary-used-percent", "-1"],
     ["primary-used-percent", "NaN"],
     ["primary-used-percent", "Infinity"],
     ["primary-used-percent", "12oops"],
-    ["primary-window-minutes", "10080"],
-    ["secondary-window-minutes", "300"],
     ["primary-reset-at", String(now)],
     ["secondary-reset-at", String(now - 1)],
     ["primary-reset-at", "1790003600.5"],
@@ -119,6 +129,65 @@ describe("Снимок окон квоты", () => {
     expect(await fs.readFile(destination, "utf8")).toBe("прежний снимок");
     expect(await fs.readdir(root)).toEqual(["codex-rate-limits.json"]);
   });
+
+  it("сохраняет недельное primary из обезличенного живого ответа 28.10.2026", async () => {
+    // Разрешённые заголовки /responses; второе окно отключено сервером.
+    const input = liveHeaders();
+    vi.mocked(Date.now).mockReturnValue(1793163821000);
+    await captureCodexRateLimits(input);
+    expect(JSON.parse(await fs.readFile(destination, "utf8"))).toEqual({
+      capturedAt: 1793163821,
+      seven_day: { used_percentage: 45, resets_at: 1793599678 },
+    });
+  });
+
+  it.each(["primary", "secondary"])(
+    "сохраняет единственное пятичасовое окно %s",
+    async (side) => {
+      const input = new Headers({
+        [`x-codex-${side}-used-percent`]: "12.5",
+        [`x-codex-${side}-window-minutes`]: "300",
+        [`x-codex-${side}-reset-after-seconds`]: "3600",
+      });
+      await captureCodexRateLimits(input);
+      expect(JSON.parse(await fs.readFile(destination, "utf8"))).toEqual({
+        capturedAt: now,
+        five_hour: expected.five_hour,
+      });
+    },
+  );
+
+  it("сопоставляет оба переставленных окна по длительности", async () => {
+    const input = headers();
+    input.set("x-codex-primary-window-minutes", "10080");
+    input.set("x-codex-secondary-window-minutes", "300");
+    await captureCodexRateLimits(input);
+    expect(JSON.parse(await fs.readFile(destination, "utf8"))).toEqual({
+      capturedAt: now,
+      five_hour: expected.seven_day,
+      seven_day: expected.five_hour,
+    });
+  });
+
+  it.each([null, "0", "60", "301", "10081", "broken"])(
+    "не записывает неизвестную длительность %s",
+    async (minutes) => {
+      const input = headers();
+      if (minutes === null) input.delete("x-codex-primary-window-minutes");
+      else input.set("x-codex-primary-window-minutes", minutes);
+      await captureCodexRateLimits(input);
+      expect(JSON.parse(await fs.readFile(destination, "utf8"))).toEqual({
+        capturedAt: now,
+        seven_day: expected.seven_day,
+      });
+      for (const key of [...input.keys()]) {
+        if (key.startsWith("x-codex-secondary-")) input.delete(key);
+      }
+      await fs.writeFile(destination, "прежний снимок");
+      await captureCodexRateLimits(input);
+      expect(await fs.readFile(destination, "utf8")).toBe("прежний снимок");
+    },
+  );
 
   it("без заголовков не меняет содержимое и метаданные прежнего файла", async () => {
     await fs.writeFile(destination, "прежний снимок");
@@ -169,7 +238,7 @@ describe("Снимок окон квоты", () => {
     ]);
   });
 
-  it.each([true, false, 429, 503, "ошибка записи"])(
+  it.each([true, false, 429, 503, "ошибка записи", "одно окно"])(
     "подключает запись к ответу сервера: %s",
     async (mode) => {
       await fs.writeFile(
@@ -188,7 +257,7 @@ describe("Снимок окон квоты", () => {
           join(root, "нет-каталога", "quota.json"),
         );
       const status = typeof mode === "number" ? mode : 200;
-      const input = headers();
+      const input = mode === "одно окно" ? liveHeaders() : headers();
       const body =
         status === 200
           ? `data: ${JSON.stringify({
@@ -227,7 +296,12 @@ describe("Снимок окон квоты", () => {
           await expect(fs.access(destination)).rejects.toThrow();
         } else {
           expect(JSON.parse(await fs.readFile(destination, "utf8"))).toEqual(
-            expected,
+            mode === "одно окно"
+              ? {
+                  capturedAt: now,
+                  seven_day: { used_percentage: 45, resets_at: 1793599678 },
+                }
+              : expected,
           );
         }
         expect(response.body).toContain(

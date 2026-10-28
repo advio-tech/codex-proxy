@@ -46,9 +46,31 @@ export async function captureCodexRateLimits(headers: Headers): Promise<void> {
   const destination = process.env.CODEX_PROXY_RATE_LIMITS_FILE;
   if (!destination) return;
   const capturedAt = Math.floor(Date.now() / 1000);
-  const fiveHour = windowFromHeaders(headers, "primary", 300, capturedAt);
-  const sevenDay = windowFromHeaders(headers, "secondary", 10080, capturedAt);
-  if (!fiveHour || !sevenDay) return;
+  const windows: Partial<
+    Record<
+      "five_hour" | "seven_day",
+      {
+        used_percentage: number;
+        resets_at: number;
+      }
+    >
+  > = {};
+  for (const window of ["primary", "secondary"]) {
+    const minutes = numberHeader(headers, `x-codex-${window}-window-minutes`);
+    const field =
+      minutes === 300
+        ? "five_hour"
+        : minutes === 10080
+          ? "seven_day"
+          : undefined;
+    // Неизвестные и отключённые окна не имеют поля в формате потребителя.
+    if (!field) continue;
+    const value = windowFromHeaders(headers, window, minutes!, capturedAt);
+    // Неполное известное окно не должно затирать предыдущий снимок.
+    if (!value || windows[field]) return;
+    windows[field] = value;
+  }
+  if (Object.keys(windows).length === 0) return;
 
   const temporary = join(
     dirname(destination),
@@ -63,8 +85,7 @@ export async function captureCodexRateLimits(headers: Headers): Promise<void> {
       await file.writeFile(
         JSON.stringify({
           capturedAt,
-          five_hour: fiveHour,
-          seven_day: sevenDay,
+          ...windows,
         }),
       );
     } finally {
