@@ -1,4 +1,4 @@
-// Loopback Anthropic Messages gateway for native Codex subscriptions.
+// Loopback Messages gateway: native Codex by default, direct Claude API by opt-in.
 import Fastify from "fastify";
 import { pathToFileURL } from "url";
 import { codexDefaults, parseProviderModel } from "./map.js";
@@ -6,13 +6,29 @@ import type { AnthropicRequest } from "./types.js";
 import { chatCodexOAuth } from "./providers/codex-oauth.js";
 import { withAggregatedReply } from "./sse-aggregator.js";
 import { getCodexAccessToken, getCodexLoginStatus, CodexNativeAuthError } from "./openai-auth.js";
+import { forwardAnthropicApi } from "./providers/anthropic-api.js";
 
 // Importing this module never starts a listener or reads credentials.
 export function createGateway() {
-  let active = codexDefaults();
+  const backend = process.env.CLAUDE_PROXY_BACKEND || "codex-oauth";
+  if (backend !== "codex-oauth" && backend !== "anthropic") {
+    throw new Error("CLAUDE_PROXY_BACKEND must be codex-oauth or anthropic");
+  }
+  let active: ReturnType<typeof codexDefaults> | { provider: "anthropic"; model?: string } =
+    backend === "anthropic" ? { provider: "anthropic" } : codexDefaults();
   const fastify = Fastify({ logger: false, bodyLimit: 100 * 1024 * 1024 });
   fastify.get("/healthz", async () => ({ ok: true, active }));
   fastify.get("/_status", async () => active);
+  if (backend === "anthropic") {
+    for (const path of ["/v1/messages", "/v1/messages/count_tokens"]) {
+      fastify.post(path, async (req, res) => {
+        const body = req.body as { model?: unknown } | null;
+        if (typeof body?.model === "string") active = { provider: "anthropic", model: body.model };
+        return forwardAnthropicApi(req, res);
+      });
+    }
+    return fastify;
+  }
   fastify.get("/codex/status", async () => getCodexLoginStatus());
 
   fastify.post("/v1/messages", async (req, res) => {
@@ -58,7 +74,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     process.once(signal, () => { void fastify.close(); });
   }
   fastify.listen({ port, host: "127.0.0.1" }).then(address => {
-    console.log(`Codex proxy listening at ${address}`);
+    console.log(`Messages proxy listening at ${address}`);
   }).catch(() => {
     console.error("Cannot start loopback proxy. Check the port and configuration.");
     process.exitCode = 1;

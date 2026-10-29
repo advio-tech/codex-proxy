@@ -3,7 +3,7 @@
   "version": "2.0.0",
   "private": true,
   "license": "MIT",
-  "description": "Local Anthropic Messages adapter for native Codex subscription authentication",
+  "description": "Local Messages gateway for native Codex subscriptions and the Claude API",
   "keywords": [
     "codex",
     "anthropic",
